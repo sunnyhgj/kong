@@ -1,7 +1,5 @@
 local mocker = require("spec.fixtures.mocker")
 
-local EXPECTED_ROUTER_ERROR = "attempt to index local 'router' (a nil value)"
-
 local function setup_it_block()
 
   -- keep track of created semaphores
@@ -170,6 +168,25 @@ describe("runloop handler", function()
       -- check semaphores
       assert.equal(1, semaphores[1].value)
       assert.equal(1, semaphores[2].value)
+    end)
+
+    it("does not call rebuild_router if async_rebuilds is on", function()
+      setup_it_block()
+
+      kong.configuration.async_rebuilds = true
+
+      local handler = require "kong.runloop.handler"
+
+      local rebuild_router_spy = spy.new(function() end)
+      handler._set_rebuild_router(rebuild_router_spy)
+      handler._set_router(mock_router)
+
+      handler.init_worker.before()
+
+      handler.access.before({})
+
+      assert.spy(rebuild_router_spy).was_called(0)
+      assert.equal(mock_router, handler._get_updated_router())
     end)
 
   end)
