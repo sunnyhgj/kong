@@ -1,5 +1,6 @@
 local mocker = require("spec.fixtures.mocker")
 
+local EXPECTED_ROUTER_ERROR = "attempt to index local 'router' (a nil value)"
 
 local function setup_it_block()
 
@@ -90,6 +91,14 @@ local function setup_it_block()
   })
 end
 
+
+local mock_router = {
+  exec = function()
+    return nil
+  end
+}
+
+
 describe("runloop handler", function()
   describe("router rebuilds", function()
 
@@ -106,6 +115,7 @@ describe("runloop handler", function()
         return nil, "error injected by test (feel free to ignore :) )"
       end)
 
+      handler._set_router(mock_router)
       handler._set_rebuild_router(rebuild_router_spy)
       handler._set_rebuild_plugins_iterator(rebuild_plugins_iterator_spy)
 
@@ -137,6 +147,7 @@ describe("runloop handler", function()
       local rebuild_plugins_iterator_spy = spy.new(function() end)
       handler._set_rebuild_router(rebuild_router_spy)
       handler._set_rebuild_plugins_iterator(rebuild_plugins_iterator_spy)
+      handler._set_router(mock_router)
 
       handler.init_worker.before()
       assert.equal(1, semaphores[1].value)

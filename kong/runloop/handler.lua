@@ -70,12 +70,12 @@ local get_plugins_iterator, get_updated_plugins_iterator
 local build_plugins_iterator, update_plugins_iterator
 local rebuild_plugins_iterator, plugins_iterator_semaphore
 
-local get_router, build_router, update_router
+local get_updated_router, build_router, update_router
 local server_header = meta._SERVER_TOKENS
 local rebuild_router, router_semaphore
 
 -- for tests
-local _set_rebuild_plugins_iterator, _set_rebuild_router
+local _set_rebuild_plugins_iterator, _set_rebuild_router, _set_router
 
 
 local update_lua_mem
@@ -708,19 +708,30 @@ do
   end
 
 
-  get_router = function()
-    return router
+  rebuild_router = function(timeout)
+    return rebuild("router", update_router, router_version, router_semaphore, timeout)
   end
 
 
-  rebuild_router = function(timeout)
-    return rebuild("router", update_router, router_version, router_semaphore, timeout)
+  get_updated_router = function()
+    local ok, err = rebuild_router(REBUILD_TIMEOUT)
+    if not ok then
+      -- If an error happens while updating, log it and return non-updated version
+      log(CRIT, "error while updating router(reason: ", err, ")")
+    end
+    return router
   end
 
 
   -- for tests only
   _set_rebuild_router = function(f)
     rebuild_router = f
+  end
+
+
+  -- for tests only
+  _set_router = function(r)
+    router = r
   end
 end
 
@@ -814,8 +825,10 @@ return {
   set_init_versions_in_cache = set_init_versions_in_cache,
 
   -- exposed only for tests
+  _set_router = _set_router,
   _set_rebuild_router = _set_rebuild_router,
   _set_rebuild_plugins_iterator = _set_rebuild_plugins_iterator,
+  _get_updated_router = get_updated_router,
 
   init_worker = {
     before = function()
@@ -894,13 +907,7 @@ return {
   },
   preread = {
     before = function(ctx)
-      local ok, err = rebuild_router(REBUILD_TIMEOUT)
-      if not ok then
-        log(ERR, "no router to route connection (reason: " .. err .. ")")
-        return exit(500)
-      end
-
-      local router = get_router()
+      local router = get_updated_router()
 
       local match_t = router.exec()
       if not match_t then
@@ -992,15 +999,7 @@ return {
   access = {
     before = function(ctx)
       -- router for Routes/Services
-
-      local ok, err = rebuild_router(REBUILD_TIMEOUT)
-
-      if not ok then
-        kong.log.err("no router to route request (reason: " .. tostring(err) ..  ")")
-        return kong.response.exit(500, { message  = "An unexpected error occurred" })
-      end
-
-      local router = get_router()
+      local router = get_updated_router()
 
       -- routing request
 
