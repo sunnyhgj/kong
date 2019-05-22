@@ -17,8 +17,8 @@ local mesh         = require "kong.runloop.mesh"
 local constants    = require "kong.constants"
 local singletons   = require "kong.singletons"
 local certificate  = require "kong.runloop.certificate"
+local concurrency  = require "kong.concurrency"
 local ngx_re       = require "ngx.re"
-local semaphore    = require "ngx.semaphore"
 local PluginsIterator = require "kong.runloop.plugins_iterator"
 
 
@@ -63,19 +63,28 @@ local CACHE_ROUTER_OPTS = { ttl = 0 }
 local SUBSYSTEMS = constants.PROTOCOLS_WITH_SUBSYSTEM
 local EMPTY_T = {}
 local TTL_ZERO = { ttl = 0 }
-local REBUILD_TIMEOUT
+
+
+local ROUTER_SYNC_OPTS
+local ROUTER_ASYNC_OPTS
+local PLUGINS_ITERATOR_SYNC_OPTS
+local PLUGINS_ITERATOR_ASYNC_OPTS
 
 
 local get_plugins_iterator, get_updated_plugins_iterator
 local build_plugins_iterator, update_plugins_iterator
-local rebuild_plugins_iterator, plugins_iterator_semaphore
+local rebuild_plugins_iterator
 
 local get_updated_router, build_router, update_router
 local server_header = meta._SERVER_TOKENS
-local rebuild_router, router_semaphore
+local rebuild_router
 
 -- for tests
-local _set_rebuild_plugins_iterator, _set_rebuild_router, _set_router
+local _set_update_plugins_iterator
+local _set_update_router
+local _set_build_router
+local _set_router
+local _set_router_version
 
 
 local update_lua_mem
@@ -387,31 +396,16 @@ do
   end
 
 
-  local function rebuild_timer(premature, name, callback, version, semaphore)
-    if premature then
-      semaphore:post()
-      return
-    end
-
-    local pok, ok, err = pcall(callback, version)
-    if not pok or not ok then
-      log(CRIT, "could not rebuild ", name, " asynchronously:", ok or err)
-    end
-    semaphore:post()
-  end
-
-
   -- @param name "router" or "plugins_iterator"
   -- @param callback A function that will update either the router or plugins_iterator
   -- @param version target version
-  -- @param semaphore router_semaphore or plugins_iterator_semaphore
-  -- @param timeout how much time to wait when trying to acquire the semaphore.
+  -- @param opts concurrency options, including lock name and timeout.
   -- @returns true if callback was either successfully executed synchronously,
   -- enqueued via async timer, or not needed (because current_version == target).
   -- nil otherwise (callback was neither called successfully nor enqueued,
   -- or an error happened).
   -- @returns error message as a second return value in case of failure/error
-  rebuild = function(name, callback, version, semaphore, timeout)
+  rebuild = function(name, callback, version, opts)
     local current_version, err = get_version(name)
     if not current_version then
       return nil, err
@@ -420,36 +414,7 @@ do
       return true
     end
 
-    local ok, err = semaphore:wait(timeout)
-    if not ok then
-      return nil, err
-    end
-
-    current_version, err = get_version(name)
-    if not current_version then
-      semaphore:post()
-      return nil, err
-    end
-    if current_version == version then
-      semaphore:post()
-      return true
-    end
-
-    if timeout > 0 then
-      local pok, ok, err = pcall(callback, version)
-      semaphore:post()
-      if not pok or not ok then
-        return nil, "could not rebuild ", name, " synchronously: " .. tostring(ok or err)
-      end
-      return ok, err
-    end
-
-    local ok, err = timer_at(0, rebuild_timer, name, callback, version, semaphore)
-    if not ok then
-      semaphore:post()
-      return nil, "could not create rebuild timer: " .. err
-    end
-    return true
+    return concurrency.with_coroutine_mutex(opts, callback)
   end
 end
 
@@ -488,15 +453,15 @@ do
 
 
   rebuild_plugins_iterator = function(timeout)
-    local version = plugins_iterator and plugins_iterator.version
+    local plugins_iterator_version = plugins_iterator and plugins_iterator.version
     return rebuild("plugins_iterator", update_plugins_iterator,
-                   version, plugins_iterator_semaphore, timeout)
+                   plugins_iterator_version, timeout)
   end
 
 
   get_updated_plugins_iterator = function()
     if not kong.configuration.async_rebuilds then
-      local ok, err = rebuild_plugins_iterator(REBUILD_TIMEOUT)
+      local ok, err = rebuild_plugins_iterator(PLUGINS_ITERATOR_SYNC_OPTS)
       if not ok then
         -- If an error happens while updating, log it and return non-updated version
         log(CRIT, "error while updating plugins iterator: ", err)
@@ -511,8 +476,8 @@ do
   end
 
   -- for tests only
-  _set_rebuild_plugins_iterator = function(f)
-    rebuild_plugins_iterator = f
+  _set_update_plugins_iterator = function(f)
+    update_plugins_iterator = f
   end
 end
 
@@ -710,14 +675,14 @@ do
   end
 
 
-  rebuild_router = function(timeout)
-    return rebuild("router", update_router, router_version, router_semaphore, timeout)
+  rebuild_router = function(opts)
+    return rebuild("router", update_router, router_version, opts)
   end
 
 
   get_updated_router = function()
     if not kong.configuration.async_rebuilds then
-      local ok, err = rebuild_router(REBUILD_TIMEOUT)
+      local ok, err = rebuild_router(ROUTER_SYNC_OPTS)
       if not ok then
         -- If an error happens while updating, log it and return non-updated version
         log(CRIT, "error while updating router(reason: ", err, ")")
@@ -728,14 +693,26 @@ do
 
 
   -- for tests only
-  _set_rebuild_router = function(f)
-    rebuild_router = f
+  _set_update_router = function(f)
+    update_router = f
+  end
+
+
+  -- for tests only
+  _set_build_router = function(f)
+    build_router = f
   end
 
 
   -- for tests only
   _set_router = function(r)
     router = r
+  end
+
+
+  -- for tests only
+  _set_router_version = function(v)
+    router_version = v
   end
 end
 
@@ -830,25 +807,16 @@ return {
 
   -- exposed only for tests
   _set_router = _set_router,
-  _set_rebuild_router = _set_rebuild_router,
-  _set_rebuild_plugins_iterator = _set_rebuild_plugins_iterator,
+  _set_update_router = _set_update_router,
+  _set_build_router = _set_build_router,
+  _set_router_version = _set_router_version,
+  _set_update_plugins_iterator = _set_update_plugins_iterator,
   _get_updated_router = get_updated_router,
 
   init_worker = {
     before = function()
       reports.init_worker()
       update_lua_mem(true)
-
-      local err
-      plugins_iterator_semaphore, err = semaphore.new(1)
-      if err then
-        log(CRIT, "failed to create plugins iterator semaphore: ", err)
-      end
-
-      router_semaphore, err = semaphore.new(1)
-      if err then
-        log(CRIT, "failed to create router semaphore: ", err)
-      end
 
       register_events()
 
@@ -865,26 +833,54 @@ return {
 
         -- Don't wait for the semaphore (timeout = 0) when updating via the timer
         -- If the semaphore is locked, that means that the rebuild is already ongoing
-        local ok, err = rebuild_router(0)
-        if not ok and error ~= "timeout" then -- ignore semaphore timeout
+        local ok, err = rebuild_router(ROUTER_ASYNC_OPTS)
+        if not ok then
           log(ERR, "failure while rebuilding router via timer: ", err)
         end
-        ok, err = rebuild_plugins_iterator(0)
-        if not ok and error ~= "timeout" then -- ignore semaphore timeout
+      end)
+
+      timer_every(1, function(premature)
+        if premature then
+          return
+        end
+
+        local ok, err = rebuild_plugins_iterator(PLUGINS_ITERATOR_ASYNC_OPTS)
+        if not ok then
           log(ERR, "failure while rebuilding plugins_iterator via timer: ", err)
         end
       end)
 
       do
-        REBUILD_TIMEOUT = 60
+        local rebuild_timeout = 60
 
         if kong.configuration.database == "cassandra" then
-          REBUILD_TIMEOUT = kong.configuration.cassandra_timeout / 1000
+          rebuild_timeout = kong.configuration.cassandra_timeout / 1000
         end
 
         if kong.configuration.database == "postgres" then
-          REBUILD_TIMEOUT = kong.configuration.pg_timeout / 1000
+          rebuild_timeout = kong.configuration.pg_timeout / 1000
         end
+
+        ROUTER_SYNC_OPTS = {
+          name = "router",
+          timeout = rebuild_timeout,
+          on_timeout = "run_unlocked",
+        }
+        ROUTER_ASYNC_OPTS = {
+          name = "router",
+          timeout = 0,
+          on_timeout = "return_true",
+        }
+        PLUGINS_ITERATOR_SYNC_OPTS = {
+          name = "plugins_iterator",
+          timeout = rebuild_timeout,
+          on_timeout = "run_unlocked",
+        }
+        PLUGINS_ITERATOR_ASYNC_OPTS = {
+          name = "plugins_iterator",
+          timeout = 0,
+          on_timeout = "return_true",
+        }
       end
 
     end
